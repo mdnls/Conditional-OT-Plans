@@ -24,17 +24,12 @@ class MNISTNetEnsemble():
         self.critic = ImageCritic(input_im_size=32, layers=4, channels=[1, 64, 128, 256, 512]).to(device)
 
 
-def run(Q_batch_iter, z_batch_iter, net_ensemble, opt_iter_schedule, artifacts_path, device):
+def run(Q_batch_iter, P_batch_iter, z_batch_iter, net_ensemble, opt_iter_schedule, artifacts_path, device):
 
     assert (len(opt_iter_schedule) == 3) and all([type(o) == int for o in opt_iter_schedule]),\
         "opt_iter_schedule must contain 3 integers"
 
     opt_loops, sampler_steps, critic_steps = opt_iter_schedule
-
-    # TODO: add support for either choosing or checking the batch size of output from batch iterators
-    outp_data_dim = Q_batch_iter.data_dim
-    z_data_dim = z_batch_iter.data_dim
-
     sampler, critic = net_ensemble.sampler, net_ensemble.critic
 
     sampler_opt = torch.optim.RMSprop(params = sampler.parameters(), lr=0.00005)
@@ -43,7 +38,6 @@ def run(Q_batch_iter, z_batch_iter, net_ensemble, opt_iter_schedule, artifacts_p
     # inf me
     def sampler_closure(inp_sample, z_sample, true_outp_sample):
         sampler_opt.zero_grad()
-        sampls = sampler(inp_sample, z_sample)
         total_loss = torch.mean(critic(true_outp_sample) - critic(sampler(inp_sample, z_sample)), dim=0)
         total_loss.backward()
         return total_loss
@@ -76,6 +70,11 @@ def run(Q_batch_iter, z_batch_iter, net_ensemble, opt_iter_schedule, artifacts_p
             Q_batch_iter = iter(Q_batch_iter)
             outp_sample = torch.FloatTensor(next(Q_batch_iter)).to(device)
         try:
+            inp_sample = torch.FloatTensor(next(P_batch_iter)).to(device)
+        except StopIteration:
+            P_batch_iter = iter(P_batch_iter)
+            inp_sample = torch.FloatTensor(next(P_batch_iter)).to(device)
+        try:
             z_sample = torch.FloatTensor(next(z_batch_iter)).to(device)
         except StopIteration:
             z_batch_iter = iter(z_batch_iter)
@@ -83,11 +82,11 @@ def run(Q_batch_iter, z_batch_iter, net_ensemble, opt_iter_schedule, artifacts_p
 
         s_val, c_val, d_val = 0, 0, 0
         for s_step in range(sampler_steps):
-            s = sampler_opt.step(lambda: sampler_closure(dummy_sampler_inp, z_sample, outp_sample))
+            s = sampler_opt.step(lambda: sampler_closure(inp_sample, z_sample, outp_sample))
             s_val = round(s.item(), 5)
             print(f"\rO{itr} - S{s_step} - Sampler: {s_val}, Critic: {c_val}, Disc: {d_val}", end="")
         for c_step in range(critic_steps):
-            c = critic_opt.step(lambda: critic_closure(dummy_sampler_inp, z_sample, outp_sample))
+            c = critic_opt.step(lambda: critic_closure(inp_sample, z_sample, outp_sample))
             critic.clip_weights(0.01)
             c_val = round(c.item(), 5)
             print(f"\rO{itr} - C{s_step} - Sampler: {s_val}, Critic: {c_val}, Disc: {d_val}", end="")
@@ -144,12 +143,14 @@ if __name__ == "__main__":
 
     im_size = 32
     im_dim = 32*32*3
+    P = ImageDataset(path='data/svhn', batch_size=bs, im_size=32, channels=3)
     Q = ImageDataset(path="data/mnist", batch_size=bs, im_size=32, channels=1)
-    Z = Gaussian(mu=0, sigma=1, batch_size=bs, data_dim=128)
+    Z = Uniform(mu=0, bound=1, batch_size=bs, data_dim=128)
 
     net_ensemble = MNISTNetEnsemble(device='cuda')
 
     run(Q_batch_iter=Q,
+        P_batch_iter=P,
         z_batch_iter=Z,
         net_ensemble=net_ensemble,
         opt_iter_schedule=(20000, 1, 5),
