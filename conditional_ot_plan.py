@@ -4,7 +4,7 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 import yaml
 import os
 import shutil
-from lib.nets import ReLU_CNN, ReLU_MLP, Joint_ReLU_MLP, ImageSampler, ImageCritic
+from lib.nets import ImageSampler, ImageCritic, NetEnsemble
 from lib.distributions import Gaussian, TruncatedGaussian, Uniform, ProductDistribution, ImageDataset
 import numpy as np
 import scipy.stats as stats
@@ -13,7 +13,7 @@ import torchvision
 import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
 
-class MNISTNetEnsemble():
+class MNISTNetEnsemble(NetEnsemble):
     def __init__(self, device):
         self.device = device
         self.sampler = ImageSampler(input_im_size=32, output_im_size=32,
@@ -22,6 +22,16 @@ class MNISTNetEnsemble():
                                    upsampler_channels=[256, 512, 256, 128, 64, 1]).to(device)
         self.critic = ImageCritic(input_im_size=32, layers=4, channels=[1, 64, 128, 256, 512]).to(device)
         self.discriminator = ImageCritic(input_im_size=32, layers=4, channels = [4, 64, 128, 256, 512]).to(device)
+
+    def save(self, path):
+        self.save_net(self.sampler, os.path.join(path, f"sampler.pt"))
+        self.save_net(self.critic, os.path.join(path, f"critic.pt"))
+        self.save_net(self.discriminator, os.path.join(path, f"discriminator.pt"))
+
+    def load(self, path):
+        self.load_net(self.sampler, os.path.join(path, f"sampler.pt"))
+        self.load_net(self.critic, os.path.join(path, f"critic.pt"))
+        self.load_net(self.discriminator, os.path.join(path, f"discriminator.pt"))
 
 def run(P_batch_iter, Q_batch_iter, ref_batch_iter, z_batch_iter, net_ensemble, transport_cost, opt_iter_schedule, artifacts_path, device):
     '''
