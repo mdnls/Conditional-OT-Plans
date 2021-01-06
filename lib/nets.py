@@ -189,6 +189,60 @@ class ImageSampler(nn.Module):
         double_latent = torch.cat((self.downsampler(input_image), latent), dim=1)
         return self.upsampler(double_latent)
 
+class Density(nn.Module):
+    def __init__(self, inp_density_param, outp_density_param, regularization, reg_strength, transport_cost):
+        '''
+        Learn a density over the data by training an ImageCritic to solve a regularized OT problem.
+        The ImageCritic induces a data density via a regularization specific function.
+
+        Arguments:
+            - inp_density_parameter (ImageCritic): an instantiated image critic which represents input density paramater
+            - outp_density_parameter (ImageCritic):  an instantiated image critic which represents output density parameter
+            - regularization (str): 'entropy' or 'L2'
+            - reg_strength (float): weight of the regularization term
+            - transport_cost (func: Image_Batch x Image_Batch -> vector): pairwise transport cost of images in two batches
+        '''
+        super(Density, self).__init__()
+        self.transport_cost = transport_cost
+
+        # based on regularization: need a method to output a density
+        # and a method to output a regularization value, to be used in a dual objective
+        r = reg_strength
+        if(regularization == "entropy"):
+            self.penalty_fn = lambda x, y: r * torch.exp((1/r)*self._violation(x, y) - 1)
+            self.density_fn = lambda x, y: torch.exp((1/r)*self._violation(x, y) - 1)
+        elif(regularization == "l2"):
+            self.penalty_fn = lambda x, y: (1/(4*r)) * torch.relu(self._violation(x, y))**2
+            self.density_fn = lambda x, y: (1/(2*r)) * torch.relu(self._violation(x, y))
+        else:
+            raise ValueError("Invalid choice of regularization")
+
+        self.inp_density_param_net = inp_density_param
+        self.outp_density_param_net = outp_density_param
+
+    def _violation(self, x, y):
+        return self.inp_density_param_net(x) + self.outp_density_param_net(y) - self.transport_cost(x, y)
+
+    def penalty(self, x, y):
+        return self.penalty_fn(x, y)
+
+    def forward(self, x, y):
+        return self.density_fn(x, y)
+
+    def inp_density_param(self, x):
+        return self.inp_density_param_net(x)
+
+    def outp_density_param(self, y):
+        return self.outp_density_param_net(y)
+
+class NetEnsemble():
+    '''
+    Base class for net ensemble classes which group together multiple neural networks.
+    '''
+    def save_net(self, net, path):
+        torch.save(net.state_dict(), path)
+    def load_net(self, net, path):
+        net.load_state_dict(torch.load(path))
 if __name__ == "__main__":
     import numpy as np
 

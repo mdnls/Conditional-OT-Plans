@@ -144,6 +144,8 @@ class ImageDataset():
         self.dataloader_iter = iter(self.dataloader)
         return self
     def __next__(self):
-        return 2 * next(self.dataloader_iter)[0] - 1
-
+        itr = 2 * next(self.dataloader_iter)[0] - 1
+        if(itr.shape[0] < self.batch_size):
+            raise StopIteration
+        return itr
 
