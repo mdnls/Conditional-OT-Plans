@@ -4,7 +4,7 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 import yaml
 import os
 import shutil
-from lib.nets import ImageSampler, ImageCritic, NetEnsemble, Density
+from lib.nets import ImageSampler, ImageCritic, NetEnsemble, Compatibility
 from lib.distributions import Gaussian, TruncatedGaussian, Uniform, ProductDistribution, ImageDataset
 import numpy as np
 import scipy.stats as stats
@@ -12,9 +12,10 @@ import torch
 import torchvision
 import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
+from lib.SamplerOptimizers import WSamplerOptimizer, BPSamplerOptimizer, WGPSamplerOptimizer
 
 class MNISTNetEnsemble(NetEnsemble):
-    def __init__(self, device, reg_strength, transport_cost):
+    def __init__(self, device, reg_strength, transport_cost, regularization):
         self.device = device
         self.sampler = ImageSampler(input_im_size=32, output_im_size=32,
                                    downsampler_layers=5, upsampler_layers=5,
@@ -22,68 +23,24 @@ class MNISTNetEnsemble(NetEnsemble):
                                    upsampler_channels=[256, 512, 256, 128, 64, 1]).to(device)
         self.inp_density_parameter = ImageCritic(input_im_size=32, layers=4, channels=[3, 64, 128, 256, 512])
         self.outp_density_parameter = ImageCritic(input_im_size=32, layers=4, channels=[1, 64, 128, 256, 512])
-        self.density = Density(self.inp_density_parameter, self.outp_density_parameter, regularization="entropy",
+        self.cpat = Compatibility(self.inp_density_parameter, self.outp_density_parameter, regularization="entropy",
                                transport_cost=transport_cost, reg_strength=reg_strength).to(device)
         sampler_opt_critic = ImageCritic(input_im_size=32, layers=4, channels=[1, 64, 128, 256, 512]).to(device)
-        self.sampler_opt = WassSamplerOptimizer(self.sampler, self.density, sampler_opt_critic,
-                                                critic_steps=15, reg_strength=reg_strength, transport_cost=transport_cost)
+        self.sampler_opt = WGPSamplerOptimizer(self.sampler, self.cpat, sampler_opt_critic, critic_steps=5)
+        #self.sampler_opt = BPSamplerOptimizer(self.sampler, self.cpat, reg_strength, transport_cost)
+
     def save(self, path):
         self.save_net(self.sampler, os.path.join(path, f"sampler.pt"))
         self.save_net(self.inp_density_parameter, os.path.join(path, f"inp_density_parameter.pt"))
         self.save_net(self.outp_density_parameter, os.path.join(path, f"outp_density_parameter.pt"))
-        self.save_net(self.sampler_opt.critic, os.path.join(path, f"critic.pt"))
+        self.sampler_opt.save(path)
 
     def load(self, path):
         self.load_net(self.sampler, os.path.join(path, f"sampler.pt"))
-        self.load_net(self.sampler_opt.critic, os.path.join(path, f"critic.pt"))
         self.load_net(self.inp_density_parameter, os.path.join(path, f"inp_density_parameter.pt"))
         self.load_net(self.outp_density_parameter, os.path.join(path, f"outp_density_parameter.pt"))
+        self.sampler_opt.load(path)
 
-
-class WassSamplerOptimizer():
-    def __init__(self, sampler, density, critic, critic_steps, reg_strength, transport_cost):
-        '''
-        The SamplerOptimizer matches the sampler output density to the density induced by the density parameter.
-        This implementation optimizes sampler in Wasserstein-1 distance.
-
-        NOTE: transport_cost corresponds to the cost associated to the learned OT plan conditional density. It is NOT
-        related to the transport cost which is used implicitly in the WGAN formulation, used here to fit the sampler
-        density to the conditional density.
-        '''
-        self.sampler = sampler
-        self.sampler_opt = torch.optim.RMSprop(sampler.parameters(), lr=0.00005)
-        self.density = density
-        self.critic = critic
-        self.critic_opt = torch.optim.RMSprop(critic.parameters(), lr=0.00005)
-        self.critic_steps = critic_steps
-        self.reg_strength = reg_strength
-        self.transport_cost = transport_cost
-    def step(self, inp_batch, outp_batch, z_batch):
-        for _ in range(self.critic_steps):
-            self.critic_opt.step(lambda: self._critic_closure(inp_batch, outp_batch, z_batch))
-            self.critic.clip_weights(0.01)
-        return self.sampler_opt.step(lambda: self._sampler_closure(inp_batch, outp_batch, z_batch))
-
-    def _sampler_closure(self, inp_batch, outp_batch, z_batch):
-        self.sampler_opt.zero_grad()
-        crit_fake = self.critic(self.sampler(inp_batch, z_batch))
-        crit_real = self.critic(outp_batch)
-        with torch.no_grad():
-            density = self.density(inp_batch, outp_batch)
-        #density = torch.ones_like(crit_real)
-        obj = torch.mean(density * crit_real - crit_fake)
-        obj.backward()
-        return obj
-    def _critic_closure(self, inp_batch, outp_batch, z_batch):
-        self.critic_opt.zero_grad()
-        crit_fake = self.critic(self.sampler(inp_batch, z_batch))
-        crit_real = self.critic(outp_batch)
-        with torch.no_grad():
-            density = self.density(inp_batch, outp_batch)
-        #density = torch.ones_like(crit_real)
-        obj = torch.mean(density * crit_real - crit_fake)
-        (-obj).backward() # for gradient ascent
-        return obj
 
 
 def run(inp_batch_iter, outp_batch_iter, z_batch_iter, net_ensemble, transport_cost,
@@ -101,27 +58,27 @@ def run(inp_batch_iter, outp_batch_iter, z_batch_iter, net_ensemble, transport_c
         - transport_cost: an function which takes two data tensors and returns a vector of transport costs.
             The vector has one dimension per input rows of data. The value of each dimension is
             the transport cost between corresp. rows of input data.
-        - opt_iter_schedule: a tuple of four integers (N, G, D). Run N optimization steps, each including
-            G steps of training the generator and D steps of training the OT plan conditional density.
+        - opt_iter_schedule: a tuple of two integers (D, G). Run D steps of training the OT plan conditional density
+            and then run G steps of training the generator.
         - reg_strength: the regularization parameter. As lambda increases the regularization strength decreases.
         - artifacts_path: path to a folder where experimental data is saved
     '''
 
-    assert (len(opt_iter_schedule) == 3) and all([type(o) == int for o in opt_iter_schedule]),\
-        "opt_iter_schedule must contain 3 integers"
+    assert (len(opt_iter_schedule) == 2) and all([type(o) == int for o in opt_iter_schedule]),\
+        "opt_iter_schedule must contain 2 integers"
 
-    opt_loops, sampler_loops, density_loops = opt_iter_schedule
+    density_loops, sampler_loops = opt_iter_schedule
 
-    sampler, density = net_ensemble.sampler, net_ensemble.density
+    sampler, cpat = net_ensemble.sampler, net_ensemble.cpat
     sampler_opt_manager = net_ensemble.sampler_opt
 
-    density_p_opt = torch.optim.Adam(params = density.parameters(), lr=0.00001)
+    cpat_opt = torch.optim.Adam(params = cpat.parameters(), lr=0.00001)
 
-    def density_p_closure(inp_sample, outp_sample):
-        density_p_opt.zero_grad()
-        density_real_inp = density.inp_density_param(inp_sample)
-        density_real_outp = density.outp_density_param(outp_sample)
-        density_reg = density.penalty(inp_sample, outp_sample)
+    def cpat_closure(inp_sample, outp_sample):
+        cpat_opt.zero_grad()
+        density_real_inp = cpat.inp_density_param(inp_sample)
+        density_real_outp = cpat.outp_density_param(outp_sample)
+        density_reg = cpat.penalty(inp_sample, outp_sample)
         obj = torch.mean(density_real_inp + density_real_outp - density_reg)
         (-obj).backward() # for gradient ascent rather than descent
         return obj
@@ -135,7 +92,7 @@ def run(inp_batch_iter, outp_batch_iter, z_batch_iter, net_ensemble, transport_c
 
     ex_inp_grid = torchvision.utils.make_grid( (t_ex_inp_sample+1)/2)
     writer.add_image('Example Inputs', ex_inp_grid)
-    ex__outp_grid = torchvision.utils.make_grid( (t_ex_outp_sample+1)/2)
+    ex__outp_grid = torchvision.utils.make_grid( (t_ex_outp_sample[:10]+1)/2)
     writer.add_image('Example Outputs', ex__outp_grid)
 
 
@@ -152,34 +109,26 @@ def run(inp_batch_iter, outp_batch_iter, z_batch_iter, net_ensemble, transport_c
         return inp_sample, outp_sample, z_sample
 
 
-    d_val, s_val = 0, 0
-    global_itr = 0
-    for itr in range(opt_loops):
-        for d_step in range(density_loops):
-            global_itr = global_itr + 1
-            inp_sample, outp_sample, _ = new_batch(inp_batch_iter, outp_batch_iter, z_batch_iter, device)
-            d = density_p_opt.step(lambda: density_p_closure(inp_sample, outp_sample))
-            d_val = round(d.item(), 5)
-            print(f"\rO{global_itr} - Density Loss: {d_val}, Sampler: {s_val}", end="")
-            writer.add_scalars('Optimization', {
-                'Sampler': s_val,
-                'Density': d_val
-            }, global_itr)
-        for s_step in range(sampler_loops):
-            global_itr = global_itr + 1
-            inp_sample, outp_sample, z_sample = new_batch(inp_batch_iter, outp_batch_iter, z_batch_iter, device)
-            s = sampler_opt_manager.step(inp_sample, outp_sample, z_sample)
-            s_val = round(s.item(), 5)
-            print(f"\rO{global_itr} - Density Loss: {d_val}, Sampler: {s_val}", end="")
-            writer.add_scalars('Optimization', {
-                'Sampler': s_val,
-                'Density': d_val
-            }, global_itr)
-
-        if(itr % 1 == 0):
+    for d_step in range(density_loops):
+        inp_sample, outp_sample, _ = new_batch(inp_batch_iter, outp_batch_iter, z_batch_iter, device)
+        d = cpat_opt.step(lambda: cpat_closure(inp_sample, outp_sample))
+        d_val = round(d.item(), 5)
+        print(f"\rO{d_step} - Density Loss: {d_val}", end="")
+        writer.add_scalars('Optimization', {
+            'Density': d_val
+        }, d_step)
+    for s_step in range(sampler_loops):
+        inp_sample, outp_sample, z_sample = new_batch(inp_batch_iter, outp_batch_iter, z_batch_iter, device)
+        s = sampler_opt_manager.step(inp_sample, outp_sample, z_sample)
+        s_val = round(s.item(), 5)
+        print(f"\rO{s_step} - Sampler: {s_val}", end="")
+        writer.add_scalars('Optimization', {
+            'Sampler': s_val
+        }, s_step)
+        if(s_step % 500 == 0):
             samples = sampler(t_ex_inp_sample, t_ex_z_sample)
             img_grid = torchvision.utils.make_grid((samples + 1 )/2)
-            writer.add_image('Samples', img_grid, itr)
+            writer.add_image('Samples', img_grid, s_step)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Help text.")
@@ -189,7 +138,10 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--dataset", type=str, help="Choose a dataset: digits")
     parser.add_argument("--use_cpu", action="store_true", help="If true, train on CPU.")
     parser.add_argument("-b", "--batch_size", type=int, default=50, help="Batch size for training the density and generator.")
-    parser.add_argument("-r", "--reg_strength", type=float, default=0.1, help="Regularization strength.")
+    parser.add_argument("-rs", "--reg_strength", type=float, default=0.1, help="Regularization strength.")
+    parser.add_argument("--density_steps", type=int, default=500, help="Steps to train the density estimator.")
+    parser.add_argument("--sampler_steps", type=int, default=500, help="Steps to train the sampler.")
+    parser.add_argument("-r", "--regularization", type=str, default="entropy", help="Either l2 or entropy regularization.")
     args = parser.parse_args()
 
     args.device = 'cpu' if args.use_cpu else 'cuda'
@@ -229,16 +181,19 @@ if __name__ == "__main__":
         R = ProductDistribution(P, Uniform(mu=0, batch_size=bs, data_dim=(1, 32, 32), bound=1))
         Z = Uniform(mu=0, batch_size=bs, data_dim=128, bound=1)
         c = lambda x, y: torch.mean((x-y)**2, dim=(1, 2, 3))[:, None]
-        net_ensemble = MNISTNetEnsemble(args.device, reg_strength=reg_strength, transport_cost=c)
+        net_ensemble = MNISTNetEnsemble(args.device, reg_strength=reg_strength, transport_cost=c, regularization=args.regularization)
 
     net_ensemble.save(path)
+
+    #net_ensemble.load('artifacts/l2-r=0.1_2')
+
     run(inp_batch_iter=P,
         outp_batch_iter=Q,
         z_batch_iter=Z,
         net_ensemble=net_ensemble,
         transport_cost=c,
         reg_strength=reg_strength,
-        opt_iter_schedule=(40, 100, 100),
+        opt_iter_schedule=(1000, 100000),
         artifacts_path=path,
         device=args.device)
     net_ensemble.save(path)
