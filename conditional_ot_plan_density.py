@@ -15,19 +15,18 @@ from torch.utils.tensorboard import SummaryWriter
 from lib.SamplerOptimizers import WSamplerOptimizer, BPSamplerOptimizer, WGPSamplerOptimizer
 
 class MNISTNetEnsemble(NetEnsemble):
-    def __init__(self, device, reg_strength, transport_cost, regularization):
+    def __init__(self, device, reg_strength, transport_cost, inp_channels=3, outp_channels=3):
         self.device = device
         self.sampler = ImageSampler(input_im_size=32, output_im_size=32,
                                    downsampler_layers=5, upsampler_layers=5,
-                                   downsampler_channels=[3, 64, 128, 256, 512, 128],
-                                   upsampler_channels=[256, 512, 256, 128, 64, 1]).to(device)
-        self.inp_density_parameter = ImageCritic(input_im_size=32, layers=4, channels=[3, 64, 128, 256, 512])
-        self.outp_density_parameter = ImageCritic(input_im_size=32, layers=4, channels=[1, 64, 128, 256, 512])
+                                   downsampler_channels=[inp_channels, 64, 128, 256, 512, 128],
+                                   upsampler_channels=[256, 512, 256, 128, 64, outp_channels]).to(device)
+        self.inp_density_parameter = ImageCritic(input_im_size=32, layers=4, channels=[inp_channels, 64, 128, 256, 512])
+        self.outp_density_parameter = ImageCritic(input_im_size=32, layers=4, channels=[outp_channels, 64, 128, 256, 512])
         self.cpat = Compatibility(self.inp_density_parameter, self.outp_density_parameter, regularization="entropy",
                                transport_cost=transport_cost, reg_strength=reg_strength).to(device)
-        sampler_opt_critic = ImageCritic(input_im_size=32, layers=4, channels=[1, 64, 128, 256, 512]).to(device)
+        sampler_opt_critic = ImageCritic(input_im_size=32, layers=4, channels=[inp_channels, 64, 128, 256, 512]).to(device)
         self.sampler_opt = WGPSamplerOptimizer(self.sampler, self.cpat, sampler_opt_critic, critic_steps=5)
-        #self.sampler_opt = BPSamplerOptimizer(self.sampler, self.cpat, reg_strength, transport_cost)
 
     def save(self, path):
         self.save_net(self.sampler, os.path.join(path, f"sampler.pt"))
@@ -73,6 +72,8 @@ def run(inp_batch_iter, outp_batch_iter, z_batch_iter, net_ensemble, transport_c
     sampler_opt_manager = net_ensemble.sampler_opt
 
     cpat_opt = torch.optim.Adam(params = cpat.parameters(), lr=0.00001)
+    cpat_opt_lr_sched = torch.optim.lr_scheduler.ReduceLROnPlateau(cpat_opt, mode='max', factor=0.5, patience = 5, threshold=0.01)
+    size_of_epoch=100
 
     def cpat_closure(inp_sample, outp_sample):
         cpat_opt.zero_grad()
@@ -92,7 +93,7 @@ def run(inp_batch_iter, outp_batch_iter, z_batch_iter, net_ensemble, transport_c
 
     ex_inp_grid = torchvision.utils.make_grid( (t_ex_inp_sample+1)/2)
     writer.add_image('Example Inputs', ex_inp_grid)
-    ex__outp_grid = torchvision.utils.make_grid( (t_ex_outp_sample[:10]+1)/2)
+    ex__outp_grid = torchvision.utils.make_grid( (t_ex_outp_sample[:30]+1)/2)
     writer.add_image('Example Outputs', ex__outp_grid)
 
 
@@ -109,14 +110,27 @@ def run(inp_batch_iter, outp_batch_iter, z_batch_iter, net_ensemble, transport_c
         return inp_sample, outp_sample, z_sample
 
 
+    sum_obj = torch.zeros(size=(1,))
     for d_step in range(density_loops):
         inp_sample, outp_sample, _ = new_batch(inp_batch_iter, outp_batch_iter, z_batch_iter, device)
-        d = cpat_opt.step(lambda: cpat_closure(inp_sample, outp_sample))
-        d_val = round(d.item(), 5)
-        print(f"\rO{d_step} - Density Loss: {d_val}", end="")
+        obj = cpat_opt.step(lambda: cpat_closure(inp_sample, outp_sample))
+
+        avg_density = torch.mean(cpat.forward(inp_sample, outp_sample))
+
+        obj_val = round(obj.item(), 5)
+        avg_density_val = round(avg_density.item(), 5)
+        print(f"\rO{d_step} - Density Loss: {obj_val} - Average Density: {avg_density_val}", end="")
         writer.add_scalars('Optimization', {
-            'Density': d_val
+            'Objective': obj_val,
+            'Average Density': avg_density_val
         }, d_step)
+
+        sum_obj += obj
+        if(d_step % size_of_epoch == size_of_epoch - 1):
+            avg_obj = sum_obj / size_of_epoch
+            sum_obj = torch.zeros(size=(1,))
+            cpat_opt_lr_sched.step(avg_obj)
+
     for s_step in range(sampler_loops):
         inp_sample, outp_sample, z_sample = new_batch(inp_batch_iter, outp_batch_iter, z_batch_iter, device)
         s = sampler_opt_manager.step(inp_sample, outp_sample, z_sample)
@@ -135,7 +149,7 @@ if __name__ == "__main__":
     parser.add_argument("-n", "--name", type=str, help="Name of this experiment.")
     parser.add_argument("-y", "--yaml", type=str, help="Path of a yaml configuration file to use. If provided, this config will overwrite any arguments.")
     parser.add_argument("--overwrite", action="store_true", help="If true, overwrite previous experimental results with the same name")
-    parser.add_argument("-d", "--dataset", type=str, help="Choose a dataset: digits")
+    parser.add_argument("-d", "--dataset", type=str, help="Choose a dataset: usps-mnist, svhn-mnist")
     parser.add_argument("--use_cpu", action="store_true", help="If true, train on CPU.")
     parser.add_argument("-b", "--batch_size", type=int, default=50, help="Batch size for training the density and generator.")
     parser.add_argument("-rs", "--reg_strength", type=float, default=0.1, help="Regularization strength.")
@@ -173,7 +187,16 @@ if __name__ == "__main__":
 
     bs = args.batch_size
     reg_strength = args.reg_strength
-    if(args.dataset == "digits"):
+    if(args.dataset == "usps-mnist"):
+        im_size = 32
+        im_dim = 32*32*3
+        P = ImageDataset(path="data/usps", batch_size=bs, im_size=16, channels=1)
+        Q = ImageDataset(path="data/mnist", batch_size=bs, im_size=16, channels=1)
+        R = ProductDistribution(P, Uniform(mu=0, batch_size=bs, data_dim=(1, 32, 32), bound=1))
+        Z = Uniform(mu=0, batch_size=bs, data_dim=128, bound=1)
+        c = lambda x, y: torch.mean((x-y)**2, dim=(1, 2, 3))[:, None]
+        net_ensemble = MNISTNetEnsemble(args.device, reg_strength=reg_strength, transport_cost=c, inp_channels=1, outp_channels=1)
+    elif(args.dataset == "svhn-mnist"):
         im_size = 32
         im_dim = 32*32*3
         P = ImageDataset(path="data/svhn", batch_size=bs, im_size=32)
@@ -181,7 +204,9 @@ if __name__ == "__main__":
         R = ProductDistribution(P, Uniform(mu=0, batch_size=bs, data_dim=(1, 32, 32), bound=1))
         Z = Uniform(mu=0, batch_size=bs, data_dim=128, bound=1)
         c = lambda x, y: torch.mean((x-y)**2, dim=(1, 2, 3))[:, None]
-        net_ensemble = MNISTNetEnsemble(args.device, reg_strength=reg_strength, transport_cost=c, regularization=args.regularization)
+        net_ensemble = MNISTNetEnsemble(args.device, reg_strength=reg_strength, transport_cost=c, inp_channels=3, outp_channels=1)
+    else:
+        raise ValueError(f"'{args.dataset}' is an invalid choice of dataset.")
 
     net_ensemble.save(path)
 
@@ -193,7 +218,7 @@ if __name__ == "__main__":
         net_ensemble=net_ensemble,
         transport_cost=c,
         reg_strength=reg_strength,
-        opt_iter_schedule=(1000, 100000),
+        opt_iter_schedule=(100000, 0),
         artifacts_path=path,
         device=args.device)
     net_ensemble.save(path)
