@@ -149,3 +149,17 @@ class ImageDataset():
             raise StopIteration
         return itr
 
+
+class FeatureTransform:
+    def __init__(self, transf_net):
+        '''
+        A dataset transform to be used in a DataLoader. Computes output features for each input sample using transf_net.
+
+        Arguments:
+            - transf_net (nn.Module): a neural network.
+        '''
+        self.transf_net = transf_net
+
+    def __call__(self, sample):
+        data, labels = sample
+        return self.transf_net(data), labels
